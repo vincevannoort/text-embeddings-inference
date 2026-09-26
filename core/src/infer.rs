@@ -1,4 +1,4 @@
-use crate::queue::{Entry, Metadata, NextBatch, Queue};
+use crate::queue::{Entry, Metadata, NextBatch, Queue, QueuePriority};
 use crate::tokenization::{EncodingInput, RawEncoding, Tokenization};
 use crate::TextEmbeddingsError;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use tracing::instrument;
 pub struct Infer {
     tokenization: Tokenization,
     queue: Queue,
+    priority: QueuePriority,
     /// Shared notify
     notify_batching_task: Arc<Notify>,
     /// Inference limit
@@ -49,10 +50,18 @@ impl Infer {
         Self {
             tokenization,
             queue,
+            priority: QueuePriority::Normal,
             notify_batching_task,
             limit_concurrent_requests: semaphore,
             backend,
         }
+    }
+
+    /// Clone this inference handle with a request-specific queue priority.
+    pub fn with_priority(&self, priority: QueuePriority) -> Self {
+        let mut infer = self.clone();
+        infer.priority = priority;
+        infer
     }
 
     #[instrument(skip(self, inputs))]
@@ -360,16 +369,19 @@ impl Infer {
         let (response_tx, response_rx) = oneshot::channel();
 
         // Append the request to the queue
-        self.queue.append(Entry {
-            metadata: Metadata {
-                response_tx,
-                tokenization: start_time.elapsed(),
-                queue_time: Instant::now(),
-                prompt_tokens: encoding.input_ids.len(),
-                pooling,
+        self.queue.append_with_priority(
+            Entry {
+                metadata: Metadata {
+                    response_tx,
+                    tokenization: start_time.elapsed(),
+                    queue_time: Instant::now(),
+                    prompt_tokens: encoding.input_ids.len(),
+                    pooling,
+                },
+                encoding,
             },
-            encoding,
-        });
+            self.priority,
+        );
 
         self.notify_batching_task.notify_one();
 
@@ -426,16 +438,19 @@ impl Infer {
         let (response_tx, response_rx) = oneshot::channel();
 
         // Append the request to the queue
-        self.queue.append(Entry {
-            metadata: Metadata {
-                response_tx,
-                tokenization: start_time.elapsed(),
-                queue_time: Instant::now(),
-                prompt_tokens: encoding.input_ids.len(),
-                pooling: true,
+        self.queue.append_with_priority(
+            Entry {
+                metadata: Metadata {
+                    response_tx,
+                    tokenization: start_time.elapsed(),
+                    queue_time: Instant::now(),
+                    prompt_tokens: encoding.input_ids.len(),
+                    pooling: true,
+                },
+                encoding,
             },
-            encoding,
-        });
+            self.priority,
+        );
 
         self.notify_batching_task.notify_one();
 

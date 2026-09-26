@@ -34,6 +34,7 @@ use text_embeddings_backend::BackendError;
 use text_embeddings_core::infer::{
     AllEmbeddingsInferResponse, Infer, InferMetadata, PooledEmbeddingsInferResponse,
 };
+use text_embeddings_core::queue::QueuePriority;
 use text_embeddings_core::tokenization::{into_tokens, SimpleToken as CoreSimpleToken};
 use text_embeddings_core::TextEmbeddingsError;
 use tokio::sync::OwnedSemaphorePermit;
@@ -42,6 +43,21 @@ use tracing::instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+fn request_priority(headers: &HeaderMap) -> Result<QueuePriority, ErrorResponse> {
+    let Some(value) = headers.get("x-tei-priority") else {
+        return Ok(QueuePriority::Normal);
+    };
+
+    match value.to_str() {
+        Ok(value) if value.eq_ignore_ascii_case("high") => Ok(QueuePriority::High),
+        Ok(value) if value.eq_ignore_ascii_case("normal") => Ok(QueuePriority::Normal),
+        _ => Err(ErrorResponse {
+            error: "x-tei-priority must be either 'high' or 'normal'".to_string(),
+            error_type: ErrorType::Validation,
+        }),
+    }
+}
 
 ///Text Embeddings Inference endpoint info
 #[utoipa::path(
@@ -82,6 +98,7 @@ async fn health(infer: Extension<Infer>) -> Result<(), (StatusCode, Json<ErrorRe
 post,
 tag = "Text Embeddings Inference",
 path = "/predict",
+params(("x-tei-priority" = Option<String>, Header, description = "Inference queue priority: high or normal (default: normal)")),
 request_body = PredictRequest,
 responses(
 (status = 200, description = "Predictions", body = PredictResponse),
@@ -105,8 +122,11 @@ async fn predict(
     infer: Extension<Infer>,
     info: Extension<Info>,
     Extension(context): Extension<Option<opentelemetry::Context>>,
+    request_headers: HeaderMap,
     Json(req): Json<PredictRequest>,
 ) -> Result<(HeaderMap, Json<PredictResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let priority = request_priority(&request_headers)?;
+    let infer = Extension(infer.0.with_priority(priority));
     let span = tracing::Span::current();
     if let Some(context) = context {
         span.set_parent(context);
@@ -283,6 +303,7 @@ async fn predict(
 post,
 tag = "Text Embeddings Inference",
 path = "/rerank",
+params(("x-tei-priority" = Option<String>, Header, description = "Inference queue priority: high or normal (default: normal)")),
 request_body = RerankRequest,
 responses(
 (status = 200, description = "Ranks", body = RerankResponse),
@@ -306,8 +327,11 @@ async fn rerank(
     infer: Extension<Infer>,
     info: Extension<Info>,
     Extension(context): Extension<Option<opentelemetry::Context>>,
+    request_headers: HeaderMap,
     Json(req): Json<RerankRequest>,
 ) -> Result<(HeaderMap, Json<RerankResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let priority = request_priority(&request_headers)?;
+    let infer = Extension(infer.0.with_priority(priority));
     let span = tracing::Span::current();
     if let Some(context) = context {
         span.set_parent(context);
@@ -476,6 +500,7 @@ async fn rerank(
 post,
 tag = "Text Embeddings Inference",
 path = "/similarity",
+params(("x-tei-priority" = Option<String>, Header, description = "Inference queue priority: high or normal (default: normal)")),
 request_body = SimilarityRequest,
 responses(
 (status = 200, description = "Sentence Similarity", body = SimilarityResponse),
@@ -499,8 +524,11 @@ async fn similarity(
     infer: Extension<Infer>,
     info: Extension<Info>,
     context: Extension<Option<opentelemetry::Context>>,
+    request_headers: HeaderMap,
     Json(req): Json<SimilarityRequest>,
 ) -> Result<(HeaderMap, Json<SimilarityResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let priority = request_priority(&request_headers)?;
+    let infer = Extension(infer.0.with_priority(priority));
     if req.inputs.sentences.is_empty() {
         let message = "`inputs.sentences` cannot be empty".to_string();
         tracing::error!("{message}");
@@ -546,7 +574,8 @@ async fn similarity(
     };
 
     // Get embeddings
-    let (header_map, embed_response) = embed(infer, info, context, Json(embed_req)).await?;
+    let (header_map, embed_response) =
+        embed(infer, info, context, request_headers, Json(embed_req)).await?;
     let embeddings = embed_response.0 .0;
 
     // Compute cosine
@@ -562,6 +591,7 @@ async fn similarity(
 post,
 tag = "Text Embeddings Inference",
 path = "/embed",
+params(("x-tei-priority" = Option<String>, Header, description = "Inference queue priority: high or normal (default: normal)")),
 request_body = EmbedRequest,
 responses(
 (status = 200, description = "Embeddings", body = EmbedResponse),
@@ -585,8 +615,11 @@ async fn embed(
     infer: Extension<Infer>,
     info: Extension<Info>,
     Extension(context): Extension<Option<opentelemetry::Context>>,
+    request_headers: HeaderMap,
     Json(req): Json<EmbedRequest>,
 ) -> Result<(HeaderMap, Json<EmbedResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let priority = request_priority(&request_headers)?;
+    let infer = Extension(infer.0.with_priority(priority));
     let span = tracing::Span::current();
     if let Some(context) = context {
         span.set_parent(context);
@@ -742,6 +775,7 @@ async fn embed(
 post,
 tag = "Text Embeddings Inference",
 path = "/embed_sparse",
+params(("x-tei-priority" = Option<String>, Header, description = "Inference queue priority: high or normal (default: normal)")),
 request_body = EmbedSparseRequest,
 responses(
 (status = 200, description = "Embeddings", body = EmbedSparseResponse),
@@ -765,8 +799,11 @@ async fn embed_sparse(
     infer: Extension<Infer>,
     info: Extension<Info>,
     Extension(context): Extension<Option<opentelemetry::Context>>,
+    request_headers: HeaderMap,
     Json(req): Json<EmbedSparseRequest>,
 ) -> Result<(HeaderMap, Json<EmbedSparseResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let priority = request_priority(&request_headers)?;
+    let infer = Extension(infer.0.with_priority(priority));
     let span = tracing::Span::current();
     if let Some(context) = context {
         span.set_parent(context);
@@ -929,6 +966,7 @@ async fn embed_sparse(
 post,
 tag = "Text Embeddings Inference",
 path = "/embed_all",
+params(("x-tei-priority" = Option<String>, Header, description = "Inference queue priority: high or normal (default: normal)")),
 request_body = EmbedAllRequest,
 responses(
 (status = 200, description = "Embeddings", body = EmbedAllResponse),
@@ -952,8 +990,11 @@ async fn embed_all(
     infer: Extension<Infer>,
     info: Extension<Info>,
     Extension(context): Extension<Option<opentelemetry::Context>>,
+    request_headers: HeaderMap,
     Json(req): Json<EmbedAllRequest>,
 ) -> Result<(HeaderMap, Json<EmbedAllResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let priority = request_priority(&request_headers)?;
+    let infer = Extension(infer.0.with_priority(priority));
     let span = tracing::Span::current();
     if let Some(context) = context {
         span.set_parent(context);
@@ -1105,6 +1146,7 @@ async fn embed_all(
 post,
 tag = "Text Embeddings Inference",
 path = "/v1/embeddings",
+params(("x-tei-priority" = Option<String>, Header, description = "Inference queue priority: high or normal (default: normal)")),
 request_body = OpenAICompatRequest,
 responses(
 (status = 200, description = "Embeddings", body = OpenAICompatResponse),
@@ -1128,9 +1170,13 @@ async fn openai_embed(
     infer: Extension<Infer>,
     info: Extension<Info>,
     Extension(context): Extension<Option<opentelemetry::Context>>,
+    request_headers: HeaderMap,
     Json(req): Json<OpenAICompatRequest>,
 ) -> Result<(HeaderMap, Json<OpenAICompatResponse>), (StatusCode, Json<OpenAICompatErrorResponse>)>
 {
+    let priority = request_priority(&request_headers)
+        .map_err(|err| (StatusCode::from(&err.error_type), Json(err.into())))?;
+    let infer = Extension(infer.0.with_priority(priority));
     let encode_embedding = |array: Vec<f32>| {
         match req.encoding_format {
             EncodingFormat::Float => Embedding::Float(array),
@@ -1513,6 +1559,7 @@ async fn decode(
 post,
 tag = "Text Embeddings Inference",
 path = "/vertex",
+params(("x-tei-priority" = Option<String>, Header, description = "Inference queue priority: high or normal (default: normal)")),
 request_body = VertexRequest,
 responses(
 (status = 200, description = "Results"),
@@ -1533,34 +1580,40 @@ async fn vertex_compatibility(
     infer: Extension<Infer>,
     info: Extension<Info>,
     context: Extension<Option<opentelemetry::Context>>,
+    request_headers: HeaderMap,
     Json(req): Json<VertexRequest>,
 ) -> Result<Json<VertexResponse>, (StatusCode, Json<ErrorResponse>)> {
+    request_priority(&request_headers)?;
     let embed_future = move |infer: Extension<Infer>,
                              info: Extension<Info>,
                              context: Extension<Option<opentelemetry::Context>>,
+                             request_headers: HeaderMap,
                              req: EmbedRequest| async move {
-        let result = embed(infer, info, context, Json(req)).await?;
+        let result = embed(infer, info, context, request_headers, Json(req)).await?;
         Ok(VertexPrediction::Embed(result.1 .0))
     };
     let embed_sparse_future = move |infer: Extension<Infer>,
                                     info: Extension<Info>,
                                     context: Extension<Option<opentelemetry::Context>>,
+                                    request_headers: HeaderMap,
                                     req: EmbedSparseRequest| async move {
-        let result = embed_sparse(infer, info, context, Json(req)).await?;
+        let result = embed_sparse(infer, info, context, request_headers, Json(req)).await?;
         Ok(VertexPrediction::EmbedSparse(result.1 .0))
     };
     let predict_future = move |infer: Extension<Infer>,
                                info: Extension<Info>,
                                context: Extension<Option<opentelemetry::Context>>,
+                               request_headers: HeaderMap,
                                req: PredictRequest| async move {
-        let result = predict(infer, info, context, Json(req)).await?;
+        let result = predict(infer, info, context, request_headers, Json(req)).await?;
         Ok(VertexPrediction::Predict(result.1 .0))
     };
     let rerank_future = move |infer: Extension<Infer>,
                               info: Extension<Info>,
                               context: Extension<Option<opentelemetry::Context>>,
+                              request_headers: HeaderMap,
                               req: RerankRequest| async move {
-        let result = rerank(infer, info, context, Json(req)).await?;
+        let result = rerank(infer, info, context, request_headers, Json(req)).await?;
         Ok(VertexPrediction::Rerank(result.1 .0))
     };
 
@@ -1569,10 +1622,20 @@ async fn vertex_compatibility(
         let local_infer = infer.clone();
         let local_info = info.clone();
         let local_context = context.clone();
+        let local_headers = request_headers.clone();
 
         // Rerank is the only payload that can me matched safely
         if let Ok(instance) = serde_json::from_value::<RerankRequest>(instance.clone()) {
-            futures.push(rerank_future(local_infer, local_info, local_context, instance).boxed());
+            futures.push(
+                rerank_future(
+                    local_infer,
+                    local_info,
+                    local_context,
+                    local_headers,
+                    instance,
+                )
+                .boxed(),
+            );
             continue;
         }
 
@@ -1580,22 +1643,43 @@ async fn vertex_compatibility(
             ModelType::Classifier(_) | ModelType::Reranker(_) => {
                 let instance = serde_json::from_value::<PredictRequest>(instance)
                     .map_err(ErrorResponse::from)?;
-                futures
-                    .push(predict_future(local_infer, local_info, local_context, instance).boxed());
+                futures.push(
+                    predict_future(
+                        local_infer,
+                        local_info,
+                        local_context,
+                        local_headers,
+                        instance,
+                    )
+                    .boxed(),
+                );
             }
             ModelType::Embedding(_) => {
                 if infer.is_splade() {
                     let instance = serde_json::from_value::<EmbedSparseRequest>(instance)
                         .map_err(ErrorResponse::from)?;
                     futures.push(
-                        embed_sparse_future(local_infer, local_info, local_context, instance)
-                            .boxed(),
+                        embed_sparse_future(
+                            local_infer,
+                            local_info,
+                            local_context,
+                            local_headers,
+                            instance,
+                        )
+                        .boxed(),
                     );
                 } else {
                     let instance = serde_json::from_value::<EmbedRequest>(instance)
                         .map_err(ErrorResponse::from)?;
                     futures.push(
-                        embed_future(local_infer, local_info, local_context, instance).boxed(),
+                        embed_future(
+                            local_infer,
+                            local_info,
+                            local_context,
+                            local_headers,
+                            instance,
+                        )
+                        .boxed(),
                     );
                 }
             }

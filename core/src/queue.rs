@@ -16,6 +16,18 @@ pub struct Entry {
     pub metadata: Metadata,
 }
 
+/// Scheduling priority for queued inference entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QueuePriority {
+    /// Process ahead of normal-priority entries.
+    High,
+    /// Preserve FIFO order behind high-priority entries.
+    #[default]
+    Normal,
+}
+
+const MAX_CONSECUTIVE_HIGH_PRIORITY_ENTRIES: usize = 8;
+
 /// Entry metadata
 #[derive(Debug)]
 pub struct Metadata {
@@ -67,10 +79,20 @@ impl Queue {
     /// Append an entry to the queue
     #[instrument(skip_all)]
     pub fn append(&self, entry: Entry) {
+        self.append_with_priority(entry, QueuePriority::Normal);
+    }
+
+    /// Append an entry with an explicit scheduling priority
+    #[instrument(skip_all)]
+    pub fn append_with_priority(&self, entry: Entry, priority: QueuePriority) {
         // Send append command to the background task managing the state
         // Unwrap is safe here
         self.queue_sender
-            .try_send(QueueCommand::Append(Box::new(entry), Span::current()))
+            .try_send(QueueCommand::Append(
+                Box::new(entry),
+                priority,
+                Span::current(),
+            ))
             .expect("Queue background task dropped the receiver or the receiver is too behind. This is a bug.");
     }
 
@@ -105,13 +127,20 @@ fn queue_blocking_task(
 ) {
     let capacity = max_batch_requests.unwrap_or(max_concurrent_requests);
 
-    let mut entries: VecDeque<Entry> = VecDeque::with_capacity(max_concurrent_requests);
+    let mut high_priority_entries: VecDeque<Entry> =
+        VecDeque::with_capacity(max_concurrent_requests);
+    let mut normal_priority_entries: VecDeque<Entry> =
+        VecDeque::with_capacity(max_concurrent_requests);
+    let mut consecutive_high_priority_entries = 0;
 
     while let Some(cmd) = queue_receiver.blocking_recv() {
         match cmd {
-            QueueCommand::Append(entry, span) => {
+            QueueCommand::Append(entry, priority, span) => {
                 let _span = span.entered();
-                entries.push_back(*entry);
+                match priority {
+                    QueuePriority::High => high_priority_entries.push_back(*entry),
+                    QueuePriority::Normal => normal_priority_entries.push_back(*entry),
+                }
                 let gauge = metrics::gauge!("te_queue_size");
                 gauge.increment(1.0);
             }
@@ -136,7 +165,15 @@ fn queue_blocking_task(
 
                 let mut entry_index = 0;
 
-                while let Some(entry) = entries.pop_front() {
+                loop {
+                    let Some((entry, priority)) = pop_next_entry(
+                        &mut high_priority_entries,
+                        &mut normal_priority_entries,
+                        consecutive_high_priority_entries,
+                    ) else {
+                        break;
+                    };
+
                     // Filter entries where the response receiver was dropped (== entries where the request
                     // was dropped by the client)
                     if entry.metadata.response_tx.is_closed() {
@@ -155,7 +192,10 @@ fn queue_blocking_task(
                     };
 
                     if total_tokens > max_batch_tokens {
-                        entries.push_front(entry);
+                        match priority {
+                            QueuePriority::High => high_priority_entries.push_front(entry),
+                            QueuePriority::Normal => normal_priority_entries.push_front(entry),
+                        }
                         break;
                     }
 
@@ -173,6 +213,7 @@ fn queue_blocking_task(
                     current_tokens += entry_tokens;
                     metadata.push(entry.metadata);
                     cu_seq_lengths.push(current_tokens as u32);
+                    record_scheduled_priority(&mut consecutive_high_priority_entries, priority);
 
                     entry_index += 1;
 
@@ -206,7 +247,7 @@ fn queue_blocking_task(
                 let histogram = metrics::histogram!("te_batch_next_tokens");
                 histogram.record(current_tokens as f64);
                 let gauge = metrics::gauge!("te_queue_size");
-                gauge.set(entries.len() as f64)
+                gauge.set((high_priority_entries.len() + normal_priority_entries.len()) as f64)
             }
         }
     }
@@ -216,9 +257,92 @@ pub type NextBatch = (Vec<Metadata>, Batch);
 
 #[derive(Debug)]
 enum QueueCommand {
-    Append(Box<Entry>, Span),
+    Append(Box<Entry>, QueuePriority, Span),
     NextBatch {
         response_sender: oneshot::Sender<Option<NextBatch>>,
         span: Span,
     },
+}
+
+fn pop_next_entry<T>(
+    high_priority_entries: &mut VecDeque<T>,
+    normal_priority_entries: &mut VecDeque<T>,
+    consecutive_high_priority_entries: usize,
+) -> Option<(T, QueuePriority)> {
+    if consecutive_high_priority_entries >= MAX_CONSECUTIVE_HIGH_PRIORITY_ENTRIES {
+        normal_priority_entries
+            .pop_front()
+            .map(|entry| (entry, QueuePriority::Normal))
+            .or_else(|| {
+                high_priority_entries
+                    .pop_front()
+                    .map(|entry| (entry, QueuePriority::High))
+            })
+    } else {
+        high_priority_entries
+            .pop_front()
+            .map(|entry| (entry, QueuePriority::High))
+            .or_else(|| {
+                normal_priority_entries
+                    .pop_front()
+                    .map(|entry| (entry, QueuePriority::Normal))
+            })
+    }
+}
+
+fn record_scheduled_priority(
+    consecutive_high_priority_entries: &mut usize,
+    priority: QueuePriority,
+) {
+    match priority {
+        QueuePriority::High => {
+            *consecutive_high_priority_entries = consecutive_high_priority_entries
+                .saturating_add(1)
+                .min(MAX_CONSECUTIVE_HIGH_PRIORITY_ENTRIES);
+        }
+        QueuePriority::Normal => *consecutive_high_priority_entries = 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        pop_next_entry, record_scheduled_priority, QueuePriority,
+        MAX_CONSECUTIVE_HIGH_PRIORITY_ENTRIES,
+    };
+    use std::collections::VecDeque;
+
+    #[test]
+    fn normal_priority_runs_after_a_high_priority_burst() {
+        let mut high = VecDeque::from((1..=10).collect::<Vec<_>>());
+        let mut normal = VecDeque::from(vec![101, 102]);
+        let mut consecutive_high_priority_entries = 0;
+
+        for expected in 1..=MAX_CONSECUTIVE_HIGH_PRIORITY_ENTRIES {
+            let (entry, priority) =
+                pop_next_entry(&mut high, &mut normal, consecutive_high_priority_entries).unwrap();
+            assert_eq!((entry, priority), (expected, QueuePriority::High));
+            record_scheduled_priority(&mut consecutive_high_priority_entries, priority);
+        }
+
+        let (entry, priority) =
+            pop_next_entry(&mut high, &mut normal, consecutive_high_priority_entries).unwrap();
+        assert_eq!((entry, priority), (101, QueuePriority::Normal));
+        record_scheduled_priority(&mut consecutive_high_priority_entries, priority);
+
+        let (entry, priority) =
+            pop_next_entry(&mut high, &mut normal, consecutive_high_priority_entries).unwrap();
+        assert_eq!((entry, priority), (9, QueuePriority::High));
+        record_scheduled_priority(&mut consecutive_high_priority_entries, priority);
+
+        let (entry, priority) =
+            pop_next_entry(&mut high, &mut normal, consecutive_high_priority_entries).unwrap();
+        assert_eq!((entry, priority), (10, QueuePriority::High));
+        record_scheduled_priority(&mut consecutive_high_priority_entries, priority);
+
+        assert_eq!(
+            pop_next_entry(&mut high, &mut normal, consecutive_high_priority_entries,),
+            Some((102, QueuePriority::Normal))
+        );
+    }
 }
